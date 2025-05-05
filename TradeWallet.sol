@@ -18,7 +18,14 @@ contract TradeWallet is TradeWalletData {
         require(success, "Execution failed");
     }
 
+    function withdrawETH(address to, uint256 amount) external {
+        require(msg.sender == manager, "Only manager can call");
+        (bool s,) = payable(to).call{value: amount}("");
+        require(s);
+    }
+
     receive() external payable {
         // Accept ETH deposits
     }
+
 }

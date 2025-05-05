@@ -247,11 +247,11 @@ interface IERC20 {
 }
 
 interface IDatabase {
-    function runSell(uint256 projectId, uint256 amount, uint256 minOut) external;
+    function runSell(uint256 projectId, uint256 minOut) external;
     function runBuy(uint256 projectId, uint256 amount, uint256 minOut) external;
     function isTimeToTrade(uint256 projectId) external view returns (bool);
     function shouldBuy(uint256 projectId) external view returns (bool);
-    function getAmountToSell(uint256 projectId) public view returns (uint256 totalAmount);
+    function getAmountToSell(uint256 projectId) external view returns (uint256 totalAmount);
     function getBuyAmountLessFee(uint256 projectId) external view returns (uint256);
     function getProjectInfo(uint256 projectId) external view returns (
         address tokenAddress,
@@ -294,7 +294,16 @@ contract TradeManager is AutomationCompatible, Ownable {
     uint256 public slippage = 95; // 5% slippage
     uint256 public v3Slippage = 90; // 10% slippage
 
+    uint256 public constant SCALE = 1e18;
+    uint256 public constant Q192 = 1 << 192;
+
     IDatabase public database;
+
+    address public forwarder;
+
+    constructor(address database_) {
+        database = IDatabase(database_);
+    }
 
     // Transfer contract tokens to an address
     function withdrawToken(address _token, uint256 amount, address to) external onlyOwner {
@@ -320,9 +329,13 @@ contract TradeManager is AutomationCompatible, Ownable {
         v3Slippage = _slippage;
     }
 
+    function setForwarder(address _forwarder) external onlyOwner {
+        forwarder = _forwarder;
+    }
+
     function checkUpkeep(bytes calldata) external override cannotExecute returns (bool upkeepNeeded, bytes memory performData) {
         uint256[] memory projects = database.getActiveProjects();
-        if (projects.length == 0) return (false, bytes(0));
+        if (projects.length == 0) return (false, "");
 
         uint256 chosenProjectId = 0;
         for (uint256 i = 0; i < projects.length;) {
@@ -333,7 +346,7 @@ contract TradeManager is AutomationCompatible, Ownable {
             }
             unchecked { ++i; }
         }
-        if (chosenProjectId == 0) return (false, bytes(0));
+        if (chosenProjectId == 0) return (false, "");
 
         // fetch project info
         (
@@ -352,7 +365,7 @@ contract TradeManager is AutomationCompatible, Ownable {
 
             if (dexAddress == v3Router) {
                 uint256 price = getV3Price(tokenAddress, pairAddress);
-                uint256 estimatedAmountOut = ( amountToBuy * 1e18 ) / price; // 1e18 is the scale factor for v3 prices
+                uint256 estimatedAmountOut = ( amountToBuy * SCALE ) / price; // 1e18 is the scale factor for v3 prices
                 uint256 minOut = ( estimatedAmountOut * v3Slippage ) / 100; // 10% slippage
                 return (true, abi.encode(chosenProjectId, amountToBuy, minOut, true));
             } else {
@@ -363,7 +376,7 @@ contract TradeManager is AutomationCompatible, Ownable {
                 uint256[] memory amounts = IV2Router(dexAddress).getAmountsOut(amountToBuy, path); 
                 uint256 minOut = ( amounts[1] * slippage ) / 100; // 5% slippage
 
-                return (true, abi.encode(chosenProjectId, amountToBuy, amountOut, true));
+                return (true, abi.encode(chosenProjectId, amountToBuy, minOut, true));
             }
         } else {
 
@@ -372,7 +385,7 @@ contract TradeManager is AutomationCompatible, Ownable {
 
             if (dexAddress == v3Router) {
                 uint256 price = getV3Price(tokenAddress, pairAddress);
-                uint256 estimatedAmountOut = ( amountToSell * price ) / 1e18; // 1e18 is the scale factor for v3 prices
+                uint256 estimatedAmountOut = ( amountToSell * price ) / SCALE; // 1e18 is the scale factor for v3 prices
                 uint256 minOut = ( estimatedAmountOut * v3Slippage ) / 100; // 10% slippage
                 return (true, abi.encode(chosenProjectId, amountToSell, minOut, false));
 
@@ -391,34 +404,21 @@ contract TradeManager is AutomationCompatible, Ownable {
     }
 
     function performUpkeep(bytes calldata performData) external {
+        require(msg.sender == forwarder || msg.sender == this.getOwner(), 'Only Forwarder');
         (uint256 projectId, uint256 amount, uint256 minOut, bool isBuying) = abi.decode(performData, (uint256, uint256, uint256, bool));
         if (isBuying) {
             database.runBuy(projectId, amount, minOut);
         } else {
-            database.runSell(projectId, amount, minOut);
+            database.runSell(projectId, minOut);
         }
     }
 
-    function getV2Price(address token, address pair) external view returns (uint256) {
-        address t0 = IPair(pair).token0();
-        address t1 = IPair(pair).token1();
-
-        uint bal0 = IERC20(t0).balanceOf(pair);
-        uint bal1 = IERC20(t1).balanceOf(pair);
-
-        if (token == t0) {
-            return (( bal1 * 1e18 ) / bal0);
-        } else {
-            return (( bal0 * 1e18 ) / bal1);
-        }
-    }
-
-    /// @param tokens   list of input tokens to price
-    /// @param lps      list of corresponding LP (pool) addresses for each token
+    /// @param token   list of input tokens to price
+    /// @param lp      list of corresponding LP (pool) addresses for each token
     function getV3Price(
         address token,
         address lp
-    ) external view returns (uint256 price) {
+    ) public view returns (uint256 price) {
 
         IPool pool = IPool(lp);
         IPool.Slot0 memory s = pool.slot0();
