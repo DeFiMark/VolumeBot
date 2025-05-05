@@ -666,18 +666,8 @@ contract Database is Ownable {
             'Not Active'
         );
 
-        // turn off project, collect remaining bnb
-        projects[projectId].status.isActive = false;
-
-        // remove project from active projects set
-        EnumerableSet.remove(activeProjects, projectId);
-        
-        // transfer remaining bnb to fee receiver
-        (bool success, ) = payable(feeReceiver).call{value: projects[projectId].status.remainingBNB}("");
-        require(success, "Failed to transfer remaining BNB to fee receiver");
-
-        // set remaining bnb to 0
-        projects[projectId].status.remainingBNB = 0;
+        // remove project
+        _removeProject(projectId);
     }
 
     function registerProject(
@@ -730,6 +720,19 @@ contract Database is Ownable {
         require(canRunProject[msg.sender], 'Permission denied');
         require(projects[projectId].status.isActive == true, "Project is not active");
         require(projects[projectId].status.lastTradeTime + projects[projectId].config.frequency <= block.timestamp, "Trade frequency not met");
+        
+        if (amount == 0) {
+            // something may have gone wrong, see if remainingBNB is zero, if it is, set us to a sell cycle and return
+            if (projects[projectId].status.remainingBNB == 0) {
+                // no more bnb, set us to a sell cycle, but first check if there are any sells to make
+                if (projects[projectId].status.consecutiveBuys == 0) {
+                    _removeProject(projectId);
+                } else {
+                    projects[projectId].status.consecutiveBuys = projects[projectId].config.buysPerSell;
+                }
+            }
+            return;
+        }
 
         // create new trade wallet to buy tokens
         address tradeWallet = cloneTradeWallet();
@@ -822,23 +825,8 @@ contract Database is Ownable {
             // disable bot if bnb received is less than minAmountToTrade
             if ((projects[projectId].status.remainingBNB + bnbReceived) <= minAmountToTrade) {
 
-                // turn off project, collect remaining bnb
-                projects[projectId].status.isActive = false;
-
-                // remove project from active projects set
-                EnumerableSet.remove(activeProjects, projectId);
-
-                // determine the send amount
-                uint256 sendAmount = address(this).balance < projects[projectId].status.remainingBNB ? address(this).balance : projects[projectId].status.remainingBNB;
-                
-                // transfer remaining bnb to fee receiver
-                if (sendAmount > 0) {
-                    (bool success, ) = payable(feeReceiver).call{value: sendAmount}("");
-                    require(success, "Failed to transfer remaining BNB to fee receiver");
-                }
-
-                // set remaining bnb to 0
-                projects[projectId].status.remainingBNB = 0;
+                // remove project
+                _removeProject(projectId);
 
             } else {
 
@@ -866,6 +854,28 @@ contract Database is Ownable {
             projects[projectId].status.remainingBNB += msg.value;
             projects[projectId].initialBNB += msg.value;
         }
+    }
+
+    function _removeProject(uint256 projectId) internal {
+
+        // turn off project, collect remaining bnb
+        projects[projectId].status.isActive = false;
+
+        // remove project from active projects set
+        EnumerableSet.remove(activeProjects, projectId);
+
+        // determine the send amount
+        uint256 sendAmount = address(this).balance < projects[projectId].status.remainingBNB ? address(this).balance : projects[projectId].status.remainingBNB;
+        
+        // transfer remaining bnb to fee receiver
+        if (sendAmount > 0) {
+            (bool success, ) = payable(feeReceiver).call{value: sendAmount}("");
+            require(success, "Failed to transfer remaining BNB to fee receiver");
+        }
+
+        // set remaining bnb to 0
+        projects[projectId].status.remainingBNB = 0;
+
     }
 
     function isTimeToTrade(uint256 projectId) external view returns (bool) {
