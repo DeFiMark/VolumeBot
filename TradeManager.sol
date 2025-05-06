@@ -1,3 +1,7 @@
+/**
+ *Submitted for verification at BscScan.com on 2025-05-03
+*/
+
 // SPDX-License-Identifier: GPL-3.0
 pragma solidity 0.8.28;
 
@@ -257,7 +261,8 @@ interface IDatabase {
         address tokenAddress,
         address dexAddress,
         address pairAddress,
-        uint256 initialBNB
+        uint256 initialBNB,
+        uint24 fee
     );
     function getActiveProjects() external view returns (uint256[] memory);
 }
@@ -333,7 +338,7 @@ contract TradeManager is AutomationCompatible, Ownable {
         forwarder = _forwarder;
     }
 
-    function checkUpkeep(bytes calldata) external override cannotExecute returns (bool upkeepNeeded, bytes memory performData) {
+    function viewUpkeepResults() external view returns (bool upkeepNeeded, bytes memory performData) {
         uint256[] memory projects = database.getActiveProjects();
         if (projects.length == 0) return (false, "");
 
@@ -353,6 +358,77 @@ contract TradeManager is AutomationCompatible, Ownable {
             address tokenAddress, 
             address dexAddress, 
             address pairAddress,
+            ,
+        ) = database.getProjectInfo(chosenProjectId);
+
+        // are we buying or selling
+        bool isBuying = database.shouldBuy(chosenProjectId);
+
+        if (isBuying) {
+
+            // buying
+            uint256 amountToBuy = database.getBuyAmountLessFee(chosenProjectId);
+
+            if (dexAddress == v3Router) {
+                uint256 price = getV3Price(tokenAddress, pairAddress);
+                uint256 estimatedAmountOut = ( amountToBuy * SCALE ) / price; // 1e18 is the scale factor for v3 prices
+                uint256 minOut = ( estimatedAmountOut * v3Slippage ) / 100; // 10% slippage
+                return (true, abi.encode(chosenProjectId, amountToBuy, minOut, true));
+            } else {
+                address[] memory path = new address[](2);
+                path[0] = WETH;
+                path[1] = tokenAddress;
+
+                uint256[] memory amounts = IV2Router(dexAddress).getAmountsOut(amountToBuy, path); 
+                uint256 minOut = ( amounts[1] * slippage ) / 100; // 5% slippage
+
+                return (true, abi.encode(chosenProjectId, amountToBuy, minOut, true));
+            }
+        } else {
+
+            // selling
+            uint256 amountToSell = database.getAmountToSell(chosenProjectId);
+
+            if (dexAddress == v3Router) {
+                uint256 price = getV3Price(tokenAddress, pairAddress);
+                uint256 estimatedAmountOut = ( amountToSell * price ) / SCALE; // 1e18 is the scale factor for v3 prices
+                uint256 minOut = ( estimatedAmountOut * v3Slippage ) / 100; // 10% slippage
+                return (true, abi.encode(chosenProjectId, amountToSell, minOut, false));
+
+            } else {
+
+                address[] memory path = new address[](2);
+                path[0] = tokenAddress;
+                path[1] = WETH;
+
+                uint256[] memory amounts = IV2Router(dexAddress).getAmountsOut(amountToSell, path); 
+                uint256 minOut = ( amounts[1] * slippage ) / 100; // 5% slippage
+
+                return (true, abi.encode(chosenProjectId, amountToSell, minOut, false));
+            }
+        }
+    }
+
+    function checkUpkeep(bytes calldata) external override cannotExecute returns (bool upkeepNeeded, bytes memory performData) {
+        uint256[] memory projects = database.getActiveProjects();
+        if (projects.length == 0) return (false, "");
+
+        uint256 chosenProjectId = 0;
+        for (uint256 i = 0; i < projects.length;) {
+            uint256 projectId = projects[i];
+            if (database.isTimeToTrade(projectId)) {
+                chosenProjectId = projectId;
+                break;
+            }
+            unchecked { ++i; }
+        }
+        if (chosenProjectId == 0) return (false, "");
+
+        // fetch project info
+        (
+            address tokenAddress, 
+            address dexAddress, 
+            address pairAddress,,
         ) = database.getProjectInfo(chosenProjectId);
 
         // are we buying or selling

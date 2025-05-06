@@ -530,25 +530,27 @@ interface ITradeWallet {
     function execute(address target, bytes calldata data) external payable;
 }
 
+interface IWETH {
+    function withdraw(uint wad) external;
+}
+
+interface IDEXTrades {
+    function isDEXSupported(address dexAddress) external view returns (bool);
+    function getBuyData(address dexAddress, address tokenAddress, address to, uint256 amount uint256 minOut, uint24 fee) external view returns (bytes memory);
+    function getSellData(address dexAddress, address tokenAddress, uint256 amount, uint256 minOut, address to, uint24 fee) external view returns (bytes memory);
+}
+
 /**
     Tracks all projects currently running a volume bot
     Tracks all data associated
  */
 contract Database is Ownable {
 
-    struct ExactInputSingleParams {
-        address tokenIn;
-        address tokenOut;
-        uint24 fee;
-        address recipient;
-        uint256 amountIn;
-        uint256 amountOutMinimum;
-        uint160 sqrtPriceLimitX96;
-    }
-
-    address public constant v3Router = 0x13f4EA83D0bd40E75C8222255bc855a974568Dd4;
-    address public constant v2Router = 0x10ED43C718714eb63d5aA57B78B54704E256024E;
+    // WETH constant
     address public constant WETH = 0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c;
+
+    // dex trades oracle to track calldata for various dexes
+    IDEXTrades public dexTradesOracle;
 
     struct Config {
         uint256 frequency; // in seconds
@@ -585,28 +587,30 @@ contract Database is Ownable {
 
     uint256 public projectNonce = 1; // projectId
 
-    uint256 public platformFee = 250;
+    uint256 public platformFee = 200;
+    uint256 public minFee = 0.0015 ether; // covers chainlink fees
 
     address public feeReceiver;
 
     uint256 public constant FEE_DENOMINATOR = 10_000; // 100% = 10,000 basis points
 
-    uint256 public minAmountToTrade = 0.05 ether; // 0.05 BNB
+    uint256 public minAmountToTrade = 0.1 ether; // 0.1 BNB
 
-    uint256 public minStartAmount = 1 ether; // 0.05 BNB
+    uint256 public minStartAmount = 1 ether; // 1 BNB
 
     address public tradeWalletMasterCopy;
 
     bool public isPublic;
 
-    uint32 public buyAmountRandomnessShifter = 5_000; // up to +50% or -50%
+    uint32 public buyAmountRandomnessShifter = 4_000; // up to +40% or -40%
 
     EnumerableSet.UintSet private activeProjects; // all active projects
 
-    constructor(address _tradeWalletMasterCopy, address _feeReceiver) {
+    constructor(address _tradeWalletMasterCopy, address _feeReceiver, address _dexTradesOracle) {
         tradeWalletMasterCopy = _tradeWalletMasterCopy;
         feeReceiver = _feeReceiver;
         isPublic = false; // private mode by default
+        dexTradesOracle = _dexTradesOracle;
     }
 
     function setMinStartAmount(uint256 _minStartAmount) external onlyOwner {
@@ -636,6 +640,10 @@ contract Database is Ownable {
 
     function setFeeReceiver(address _feeReceiver) external onlyOwner {
         feeReceiver = _feeReceiver;
+    }
+
+    function setDEXTradesOracle(address _dexTradesOracle) external onlyOwner {
+        dexTradesOracle = _dexTradesOracle;
     }
 
     function withdrawETH(address to, uint amount) external onlyOwner {
@@ -670,6 +678,20 @@ contract Database is Ownable {
         _removeProject(projectId);
     }
 
+    function setFrequency(uint256 projectId, uint256 newFrequency) external onlyOwner {
+        require(newFrequency > 1 && newFrequency < 86400, 'Frequency');
+        projects[projectId].config.frequency = newFrequency;
+    }
+
+    function setPercentPerTrade(uint256 projectId, uint16 percentPerTrade) external onlyOwner {
+        require(percentPerTrade > 0 && percentPerTrade < FEE_DENOMINATOR, 'Invalid Percent');
+        projects[projectId].config.percentPerTrade = percentPerTrade;
+    }
+
+    function setBuysPerSell(uint256 projectId, uint8 buysPerSell) external onlyOwner {
+        projects[projectId].config.buysPerSell = buysPerSell;
+    }
+
     function registerProject(
         address tokenAddress,
         address dexAddress,
@@ -682,8 +704,15 @@ contract Database is Ownable {
         require(tokenAddress != address(0), "Token address cannot be zero");
         require(dexAddress != address(0), "Dex address cannot be zero");
         require(pairAddress != address(0), "Pair address cannot be zero");
-        require(dexAddress == v3Router || dexAddress == v2Router, "Invalid dex address");
+        require(dexTradesOracle.isDEXSupported(dexAddress), 'DEX Not Supported');
         require(buysPerSell > 1, "Buys per sell must be greater than 1");
+        require(frequency > 1 && frequency < 86400, 'Frequency');
+        require(percentPerTrade > 0 && percentPerTrade < FEE_DENOMINATOR, 'Invalid Percent');
+        require(
+            ( ( ( msg.value / ( buysPerSell ) ) * percentPerTrade ) / FEE_DENOMINATOR ) >= minAmountToTrade,
+            'Minimum Trade Amount'
+        );
+        // add a check for if the pair belongs to the router! or fetch it manually
         
         if (isPublic) {
             require(msg.value >= minStartAmount, "Insufficient BNB sent for project registration");
@@ -720,12 +749,13 @@ contract Database is Ownable {
         require(canRunProject[msg.sender], 'Permission denied');
         require(projects[projectId].status.isActive == true, "Project is not active");
         require(projects[projectId].status.lastTradeTime + projects[projectId].config.frequency <= block.timestamp, "Trade frequency not met");
-        
+
         if (amount == 0) {
             // something may have gone wrong, see if remainingBNB is zero, if it is, set us to a sell cycle and return
             if (projects[projectId].status.remainingBNB == 0) {
                 // no more bnb, set us to a sell cycle, but first check if there are any sells to make
                 if (projects[projectId].status.consecutiveBuys == 0) {
+                    // no sells, no bnb, remove project from list
                     _removeProject(projectId);
                 } else {
                     projects[projectId].status.consecutiveBuys = projects[projectId].config.buysPerSell;
@@ -740,9 +770,15 @@ contract Database is Ownable {
         // take fee
         uint256 buyAmount = _takeFee(amount);
 
-        bytes memory data = projects[projectId].dexAddress == v2Router ?
-            _buyV2Data(projects[projectId].tokenAddress, minOut, tradeWallet) :
-            _buyV3Data(projects[projectId].tokenAddress, buyAmount, minOut, tradeWallet, projects[projectId].fee);
+        //address dexAddress, address tokenAddress, address to, uint256 amount uint256 minOut, uint24 fee
+        bytes memory data = dexTradesOracle.getBuyData(
+            projects[projectId].dexAddress,
+            projects[projectId].tokenAddress,
+            tradeWallet,
+            buyAmount,
+            minOut,
+            projects[projectId].fee
+        );
 
         // get token amount before buy
         uint256 tokenAmountBefore = IERC20(projects[projectId].tokenAddress).balanceOf(tradeWallet);
@@ -809,9 +845,15 @@ contract Database is Ownable {
                 )
             );
 
-            bytes memory data = projects[projectId].dexAddress == v2Router ?
-                _sellV2Data(projects[projectId].tokenAddress, bal - 2, minOut, address(this)) :
-                _sellV3Data(projects[projectId].tokenAddress, bal - 2, minOut, address(this), projects[projectId].fee);
+            //address dexAddress, address tokenAddress, uint256 amount, uint256 minOut, address to, uint24 fee
+            bytes memory data = dexTradesOracle.getSellData(
+                projects[projectId].dexAddress,
+                projects[projectId].tokenAddress,
+                bal - 2, // NOTE: Make this subtracted amount (-2) a variable, so some projects can have it grow holder count and other's not
+                minOut,
+                address(this),
+                projects[projectId].fee
+            );
             
             // bnb balance before
             uint256 bnbBefore = address(this).balance;
@@ -819,8 +861,13 @@ contract Database is Ownable {
             // execute sell on trade wallet
             TradeWallet(payable(finalWallet)).execute(projects[projectId].dexAddress, data);
 
-            // bnb balance after
-            uint256 bnbReceived = address(this).balance - bnbBefore;
+            // see if there is WETH in here as a result of the execute, if so, add it to bnb received
+            if (IERC20(WETH).balanceOf(address(this)) > 0) {
+                IWETH(WETH).withdraw(IERC20(WETH).balanceOf(address(this)));
+            }
+
+            // bnb balance after, less fees (if any)
+            uint256 bnbReceived = _takeFee(address(this).balance - bnbBefore);            
             
             // disable bot if bnb received is less than minAmountToTrade
             if ((projects[projectId].status.remainingBNB + bnbReceived) <= minAmountToTrade) {
@@ -948,82 +995,18 @@ contract Database is Ownable {
     }
 
     function _takeFee(uint256 amount) internal returns (uint256) {
+        if (amount == 0) {
+            return amount;
+        }
         uint256 fee = (amount * platformFee) / FEE_DENOMINATOR;
+        if (fee < minFee) {
+            fee = minFee;
+        }
         if (fee > 0) {
             (bool success, ) = payable(feeReceiver).call{value: fee}("");
             require(success, "Failed to transfer fee to receiver");
         }
         return amount - fee;
-    }
-
-    function _buyV3Data(address tokenAddress, uint256 amount, uint256 minOut, address to, uint24 fee) internal pure returns (bytes memory) {
-        ExactInputSingleParams memory params = ExactInputSingleParams({
-            tokenIn: WETH,
-            tokenOut: tokenAddress,
-            fee: fee,
-            recipient: to,
-            amountIn: amount,
-            amountOutMinimum: minOut,
-            sqrtPriceLimitX96: 0
-        });
-
-        return abi.encodeWithSignature("exactInputSingle((address,address,uint24,address,uint256,uint256,uint160))", params);
-    }
-
-    function _sellV3Data(address tokenAddress, uint256 amount, uint256 minOut, address to, uint24 fee) internal pure returns (bytes memory) {
-        ExactInputSingleParams memory params = ExactInputSingleParams({
-            tokenIn: tokenAddress,
-            tokenOut: WETH,
-            fee: fee,
-            recipient: to,
-            amountIn: amount,
-            amountOutMinimum: minOut,
-            sqrtPriceLimitX96: 0
-        });
-
-        return abi.encodeWithSignature("exactInputSingle((address,address,uint24,address,uint256,uint256,uint160))", params);
-    }
-
-    function _buyV2Data(address tokenAddress, uint256 minOut, address to) internal view returns (bytes memory) {
-
-        address[] memory path = new address[](2);
-        path[0] = WETH;
-        path[1] = tokenAddress;
-
-        // get data
-        bytes memory data = abi.encodeWithSignature(
-            "swapExactETHForTokensSupportingFeeOnTransferTokens(uint256,uint256,address[],address,uint256)",
-            minOut,
-            path,
-            to,
-            block.timestamp + 100
-        );
-
-        // clear memory
-        delete path;
-
-        return data;
-    }
-
-    function _sellV2Data(address tokenAddress, uint256 amount, uint256 minOut, address to) internal view returns (bytes memory) {
-        
-        address[] memory path = new address[](2);
-        path[0] = tokenAddress;
-        path[1] = WETH;
-
-        bytes memory data = abi.encodeWithSignature(
-            "swapExactTokensForETHSupportingFeeOnTransferTokens(uint256,uint256,address[],address,uint256)",
-            amount,
-            minOut,
-            path,
-            to,
-            block.timestamp + 100
-        );
-
-        // clear memory
-        delete path;
-
-        return data;
     }
 
     function getTokenProjects(address tokenAddress) external view returns (uint256[] memory) {
