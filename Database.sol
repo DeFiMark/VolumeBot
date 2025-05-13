@@ -536,7 +536,7 @@ interface IWETH {
 
 interface IDEXTrades {
     function isDEXSupported(address dexAddress) external view returns (bool);
-    function getBuyData(address dexAddress, address tokenAddress, address to, uint256 amount uint256 minOut, uint24 fee) external view returns (bytes memory);
+    function getBuyData(address dexAddress, address tokenAddress, address to, uint256 amount, uint256 minOut, uint24 fee) external view returns (bytes memory);
     function getSellData(address dexAddress, address tokenAddress, uint256 amount, uint256 minOut, address to, uint24 fee) external view returns (bytes memory);
 }
 
@@ -556,6 +556,7 @@ contract Database is Ownable {
         uint256 frequency; // in seconds
         uint8 buysPerSell; // number of buys that happen before a sell
         uint16 percentPerTrade; // in basis points (10,000 = 100%)
+        uint256 customFee;
     }
 
     struct Status {
@@ -574,6 +575,10 @@ contract Database is Ownable {
         address dexAddress;
         address pairAddress;
         uint256 initialBNB;
+        uint256 dustValue;
+        // address operator; // operator who can call admin functions
+        // uint256 buyFee;   // buy tax
+        // uint256 sellFee;  // sell tax
         uint24 fee;
         Config config;
         Status status;
@@ -588,15 +593,17 @@ contract Database is Ownable {
     uint256 public projectNonce = 1; // projectId
 
     uint256 public platformFee = 200;
-    uint256 public minFee = 0.0015 ether; // covers chainlink fees
+    uint256 public minFee = 0.001 ether; // covers chainlink fees
 
     address public feeReceiver;
 
     uint256 public constant FEE_DENOMINATOR = 10_000; // 100% = 10,000 basis points
 
-    uint256 public minAmountToTrade = 0.1 ether; // 0.1 BNB
+    uint256 public minAmountToTrade = 0.05 ether; // 0.1 BNB
 
     uint256 public minStartAmount = 1 ether; // 1 BNB
+
+    uint256 public defaultDustValue = 0.1 ether;
 
     address public tradeWalletMasterCopy;
 
@@ -606,11 +613,19 @@ contract Database is Ownable {
 
     EnumerableSet.UintSet private activeProjects; // all active projects
 
+    // modifier onlyOperator(uint256 projectId) {
+    //     require(
+    //         msg.sender == this.getOwner() || msg.sender == projects[projectId].operator,
+    //         'Only Operator'
+    //     );
+    //     _;
+    // }
+
     constructor(address _tradeWalletMasterCopy, address _feeReceiver, address _dexTradesOracle) {
         tradeWalletMasterCopy = _tradeWalletMasterCopy;
         feeReceiver = _feeReceiver;
         isPublic = false; // private mode by default
-        dexTradesOracle = _dexTradesOracle;
+        dexTradesOracle = IDEXTrades(_dexTradesOracle);
     }
 
     function setMinStartAmount(uint256 _minStartAmount) external onlyOwner {
@@ -643,7 +658,7 @@ contract Database is Ownable {
     }
 
     function setDEXTradesOracle(address _dexTradesOracle) external onlyOwner {
-        dexTradesOracle = _dexTradesOracle;
+        dexTradesOracle = IDEXTrades(_dexTradesOracle);
     }
 
     function withdrawETH(address to, uint amount) external onlyOwner {
@@ -668,14 +683,14 @@ contract Database is Ownable {
         buyAmountRandomnessShifter = newShifter;
     }
 
-    function deActivateProject(uint256 projectId) external onlyOwner {
+    function deActivateProject(uint256 projectId, address to) external onlyOwner {
         require(
             projects[projectId].status.isActive == true,
             'Not Active'
         );
 
         // remove project
-        _removeProject(projectId);
+        _removeProject(projectId, to);
     }
 
     function setFrequency(uint256 projectId, uint256 newFrequency) external onlyOwner {
@@ -690,6 +705,23 @@ contract Database is Ownable {
 
     function setBuysPerSell(uint256 projectId, uint8 buysPerSell) external onlyOwner {
         projects[projectId].config.buysPerSell = buysPerSell;
+    }
+
+    function setCustomFee(uint256 projectId, uint256 customFee) external onlyOwner {
+        projects[projectId].config.customFee = customFee;
+    }
+
+    function setDustValue(uint256 projectId, uint256 dustValue_) external onlyOwner {
+        projects[projectId].dustValue = dustValue_;
+    }
+
+    function setMinFee(uint _minFee) external onlyOwner {
+        minFee = _minFee;
+    }
+
+    function setToSellCycle(uint256 projectId) external onlyOwner {
+        require(projects[projectId].status.consecutiveBuys > 0, 'No buys');
+        projects[projectId].status.consecutiveBuys = projects[projectId].config.buysPerSell;
     }
 
     function registerProject(
@@ -726,6 +758,7 @@ contract Database is Ownable {
         projects[projectNonce].pairAddress = pairAddress;
         projects[projectNonce].fee = fee;
         projects[projectNonce].initialBNB = msg.value;
+        projects[projectNonce].dustValue = defaultDustValue;
         projects[projectNonce].config.frequency = frequency;
         projects[projectNonce].config.buysPerSell = buysPerSell;
         projects[projectNonce].config.percentPerTrade = percentPerTrade;
@@ -750,16 +783,13 @@ contract Database is Ownable {
         require(projects[projectId].status.isActive == true, "Project is not active");
         require(projects[projectId].status.lastTradeTime + projects[projectId].config.frequency <= block.timestamp, "Trade frequency not met");
 
-        if (amount == 0) {
-            // something may have gone wrong, see if remainingBNB is zero, if it is, set us to a sell cycle and return
-            if (projects[projectId].status.remainingBNB == 0) {
-                // no more bnb, set us to a sell cycle, but first check if there are any sells to make
-                if (projects[projectId].status.consecutiveBuys == 0) {
-                    // no sells, no bnb, remove project from list
-                    _removeProject(projectId);
-                } else {
-                    projects[projectId].status.consecutiveBuys = projects[projectId].config.buysPerSell;
-                }
+        if (amount == 0 || projects[projectId].status.remainingBNB < minAmountToTrade) {
+            // no more bnb, set us to a sell cycle, but first check if there are any sells to make
+            if (projects[projectId].status.consecutiveBuys == 0) {
+                // no sells, no bnb, remove project from list
+                _removeProject(projectId, feeReceiver);
+            } else {
+                projects[projectId].status.consecutiveBuys = projects[projectId].config.buysPerSell;
             }
             return;
         }
@@ -768,7 +798,7 @@ contract Database is Ownable {
         address tradeWallet = cloneTradeWallet();
 
         // take fee
-        uint256 buyAmount = _takeFee(amount);
+        uint256 buyAmount = _takeFee(amount, projectId);
 
         //address dexAddress, address tokenAddress, address to, uint256 amount uint256 minOut, uint24 fee
         bytes memory data = dexTradesOracle.getBuyData(
@@ -803,63 +833,70 @@ contract Database is Ownable {
         projects[projectId].status.lastTradeTime = block.timestamp;
         projects[projectId].status.wallets.push(tradeWallet);
         EnumerableSet.add(projects[projectId].status.activeWallets, tradeWallet);   
+
+        if (projects[projectId].status.remainingBNB < minAmountToTrade) {
+            projects[projectId].status.consecutiveBuys = projects[projectId].config.buysPerSell;
+        }
     }
 
     function runSell(uint256 projectId, uint256 minOut) external {
         require(canRunProject[msg.sender], 'Permission denied');
-        require(projects[projectId].status.isActive == true, "Project is not active");
-        require(projects[projectId].status.lastTradeTime + projects[projectId].config.frequency <= block.timestamp, "Trade frequency not met");
+        uint _projectId = projectId;
+        require(projects[_projectId].status.isActive == true, "Project is not active");
+        require(projects[_projectId].status.lastTradeTime + projects[_projectId].config.frequency <= block.timestamp, "Trade frequency not met");
 
         // we are selling this time, choose `consecutiveBuys` wallets to batch together and sell
-        address[] memory walletsToSell = EnumerableSet.values(projects[projectId].status.activeWallets);
+        address[] memory walletsToSell = EnumerableSet.values(projects[_projectId].status.activeWallets);
         uint len = walletsToSell.length;
         address finalWallet = walletsToSell[len - 1];
+        
+        uint256 dustValue = projects[_projectId].dustValue;
         for (uint i = 0; i < len - 1;) {
 
             // get balance
-            uint currentBal = IERC20(projects[projectId].tokenAddress).balanceOf(walletsToSell[i]);
+            uint currentBal = IERC20(projects[_projectId].tokenAddress).balanceOf(walletsToSell[i]);
             if (currentBal > 0) {
                 // send these tokens into the final wallet in the list
                 TradeWallet(payable(walletsToSell[i])).execute(
-                    projects[projectId].tokenAddress,
+                    projects[_projectId].tokenAddress,
                     abi.encodeWithSignature(
                         "transfer(address,uint256)",
                         finalWallet,
-                        currentBal - 2 // send all but 2 tokens to avoid rounding errors and improve holder count
+                        currentBal - dustValue 
                     )
                 );
             }
             unchecked { ++i; }
         }
 
-        uint256 bal = IERC20(projects[projectId].tokenAddress).balanceOf(finalWallet);
+        uint256 bal = IERC20(projects[_projectId].tokenAddress).balanceOf(finalWallet);
         if (bal > 0) {
 
             // prepare approval for router
             TradeWallet(payable(finalWallet)).execute(
-                projects[projectId].tokenAddress,
+                projects[_projectId].tokenAddress,
                 abi.encodeWithSignature(
                     "approve(address,uint256)",
-                    projects[projectId].dexAddress,
-                    bal - 2
+                    projects[_projectId].dexAddress,
+                    bal - dustValue
                 )
             );
 
             //address dexAddress, address tokenAddress, uint256 amount, uint256 minOut, address to, uint24 fee
             bytes memory data = dexTradesOracle.getSellData(
-                projects[projectId].dexAddress,
-                projects[projectId].tokenAddress,
-                bal - 2, // NOTE: Make this subtracted amount (-2) a variable, so some projects can have it grow holder count and other's not
+                projects[_projectId].dexAddress,
+                projects[_projectId].tokenAddress,
+                bal - dustValue,
                 minOut,
                 address(this),
-                projects[projectId].fee
+                projects[_projectId].fee
             );
             
             // bnb balance before
             uint256 bnbBefore = address(this).balance;
 
             // execute sell on trade wallet
-            TradeWallet(payable(finalWallet)).execute(projects[projectId].dexAddress, data);
+            TradeWallet(payable(finalWallet)).execute(projects[_projectId].dexAddress, data);
 
             // see if there is WETH in here as a result of the execute, if so, add it to bnb received
             if (IERC20(WETH).balanceOf(address(this)) > 0) {
@@ -867,28 +904,28 @@ contract Database is Ownable {
             }
 
             // bnb balance after, less fees (if any)
-            uint256 bnbReceived = _takeFee(address(this).balance - bnbBefore);            
+            uint256 bnbReceived = _takeFee(address(this).balance - bnbBefore, _projectId);            
             
             // disable bot if bnb received is less than minAmountToTrade
-            if ((projects[projectId].status.remainingBNB + bnbReceived) <= minAmountToTrade) {
+            if ((projects[_projectId].status.remainingBNB + bnbReceived) <= minAmountToTrade) {
 
                 // remove project
-                _removeProject(projectId);
+                _removeProject(_projectId, feeReceiver);
 
             } else {
 
                 // update info
                 unchecked {
-                    projects[projectId].status.remainingBNB += bnbReceived;
-                    projects[projectId].status.consecutiveBuys = 0;
-                    projects[projectId].status.lastTradeTime = block.timestamp;
+                    projects[_projectId].status.remainingBNB += bnbReceived;
+                    projects[_projectId].status.consecutiveBuys = 0;
+                    projects[_projectId].status.lastTradeTime = block.timestamp;
                 }
             }
         }
 
         for (uint i = 0; i < len;) {
             // remove the wallets from the active wallets set
-            EnumerableSet.remove(projects[projectId].status.activeWallets, walletsToSell[i]);
+            EnumerableSet.remove(projects[_projectId].status.activeWallets, walletsToSell[i]);
             unchecked { ++i; }
         }
 
@@ -903,7 +940,7 @@ contract Database is Ownable {
         }
     }
 
-    function _removeProject(uint256 projectId) internal {
+    function _removeProject(uint256 projectId, address to) internal {
 
         // turn off project, collect remaining bnb
         projects[projectId].status.isActive = false;
@@ -916,7 +953,7 @@ contract Database is Ownable {
         
         // transfer remaining bnb to fee receiver
         if (sendAmount > 0) {
-            (bool success, ) = payable(feeReceiver).call{value: sendAmount}("");
+            (bool success, ) = payable(to).call{value: sendAmount}("");
             require(success, "Failed to transfer remaining BNB to fee receiver");
         }
 
@@ -952,11 +989,22 @@ contract Database is Ownable {
             return 0;
         }
 
+        // if we don't have much bnb left, use everything
+        if (remainingBNB < minAmountToTrade) {
+            return remainingBNB;
+        }
+
         // get percent per trade
         uint16 percentPerTrade = projects[projectId].config.percentPerTrade;
 
+        // determine how many consecutive buys we've done, and increase remainingBNB temporarily by some percentage
+        // uint256 increasedBNBRemaining = ( ( FEE_DENOMINATOR + ( projects[projectId].status.consecutiveBuys * percentPerTrade ) ) * projects[projectId].status.remainingBNB ) / FEE_DENOMINATOR;
+
         // determine percentage of initial bnb to use for buy
-        uint256 buyAmount = (projects[projectId].initialBNB * percentPerTrade) / FEE_DENOMINATOR;
+        // uint256 buyAmount = ( increasedBNBRemaining * percentPerTrade ) / FEE_DENOMINATOR;
+
+        // determine percentage of initial bnb to use for buy based on remaining bnb instead of initial
+        uint256 buyAmount = ( projects[projectId].status.remainingBNB * percentPerTrade ) / FEE_DENOMINATOR;
 
         if (buyAmountRandomnessShifter == 0) {
             return buyAmount > remainingBNB ? remainingBNB : buyAmount;
@@ -978,13 +1026,7 @@ contract Database is Ownable {
         }
 
         if (buyAmount > remainingBNB) {
-            if (projects[projectId].status.consecutiveBuys < ( projects[projectId].config.buysPerSell - 1 )) {
-                // we have more than 1 buy to go
-                buyAmount = remainingBNB / 2;
-            } else {
-                // this is the last buy of this cycle, use the rest of the bnb
-                buyAmount = remainingBNB;
-            }
+            buyAmount = remainingBNB; 
         }
 
         return buyAmount;
@@ -994,12 +1036,13 @@ contract Database is Ownable {
         return getBuyAmount(projectId);
     }
 
-    function _takeFee(uint256 amount) internal returns (uint256) {
+    function _takeFee(uint256 amount, uint256 projectId) internal returns (uint256) {
         if (amount == 0) {
             return amount;
         }
-        uint256 fee = (amount * platformFee) / FEE_DENOMINATOR;
-        if (fee < minFee) {
+        uint256 feePercent = projects[projectId].config.customFee == 0 ? platformFee : projects[projectId].config.customFee;
+        uint256 fee = ( amount * feePercent ) / FEE_DENOMINATOR;
+        if (fee < minFee && amount > minFee) {
             fee = minFee;
         }
         if (fee > 0) {

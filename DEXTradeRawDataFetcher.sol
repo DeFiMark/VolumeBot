@@ -1,9 +1,13 @@
+/**
+ *Submitted for verification at BscScan.com on 2025-05-06
+*/
+
 //SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
 interface IDEXTrades {
     function isDEXSupported(address dexAddress) external view returns (bool);
-    function getBuyData(address dexAddress, address tokenAddress, address to, uint256 amount uint256 minOut, uint24 fee) external view returns (bytes memory);
+    function getBuyData(address dexAddress, address tokenAddress, address to, uint256 amount, uint256 minOut, uint24 fee) external view returns (bytes memory);
     function getSellData(address dexAddress, address tokenAddress, uint256 amount, uint256 minOut, address to, uint24 fee) external view returns (bytes memory);
 }
 
@@ -29,19 +33,24 @@ contract DEXTradeRawDataFetcher is IDEXTrades {
     // maps a dex to if its supported
     mapping ( address => bool ) private _supported;
 
+    constructor() {
+        _supported[v3Router] = true;
+        _supported[v2Router] = true;
+    }
+
     function isDEXSupported(address dexAddress) external view override returns (bool) {
         return _supported[dexAddress];
     }
 
-    function getBuyData(address dexAddress, address tokenAddress, address to, uint256 amount uint256 minOut, uint24 fee) external view override returns (bytes memory) {
+    function getBuyData(address dexAddress, address tokenAddress, address to, uint256 amount, uint256 minOut, uint24 fee) external view override returns (bytes memory) {
         if (!_supported[dexAddress]) {
             return "";
         }
         
         if (dexAddress == v3Router) {
-            _buyV3Data(tokenAddress, amount, minOut, to, fee);
+            return _buyV3Data(tokenAddress, amount, minOut, to, fee);
         } else {
-            _buyV2Data(tokenAddress, minOut, to);
+            return _buyV2Data(tokenAddress, minOut, to);
         }
     }
 
@@ -51,9 +60,9 @@ contract DEXTradeRawDataFetcher is IDEXTrades {
         }
         
         if (dexAddress == v3Router) {
-            _sellV3Data(tokenAddress, amount, minOut, to, fee);
+            return _sellV3Data(tokenAddress, amount, minOut, to, fee);
         } else {
-            _sellV2Data(tokenAddress, amount, minOut, to);
+            return _sellV2Data(tokenAddress, amount, minOut, to);
         }
     }
 
@@ -93,7 +102,7 @@ contract DEXTradeRawDataFetcher is IDEXTrades {
 
         // get data
         bytes memory data = abi.encodeWithSignature(
-            "swapExactETHForTokensSupportingFeeOnTransferTokens(uint256,uint256,address[],address,uint256)",
+            "swapExactETHForTokensSupportingFeeOnTransferTokens(uint256,address[],address,uint256)",
             minOut,
             path,
             to,
